@@ -43,7 +43,7 @@ fn is_virtual_interface_name(name: &str) -> bool {
         "hyper-v", "hv_", "vethernet",         // Hyper-V
         "cf-", "clash", "wintun",              // Clash / Cloudflare WARP / WinTun
         "tailscale", "ts-",                    // Tailscale
-        "ham", "vpn",                          // 通用 VPN
+        "ham", "vpn", "vgate",                 // 通用 VPN / 企业 VPN
     ];
     patterns.iter().any(|p| n.contains(p))
 }
@@ -509,6 +509,8 @@ mod tests {
         assert!(!is_virtual_interface_name("wlan0"));
         assert!(!is_virtual_interface_name("Wi-Fi"));
         assert!(!is_virtual_interface_name("以太网"));
+        // 实测确认的企业 VPN 适配器
+        assert!(is_virtual_interface_name("vgateO"));
     }
 
     /// 评分确定性：不依赖输入顺序，虚拟接口名始终排在真实 LAN 之后
