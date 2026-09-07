@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, watch } from "vue";
 import { useAppStore } from "@/stores/useAppStore";
 import { useChatStore } from "@/stores/useChatStore";
 import NavRail from "@/components/NavRail.vue";
+import TitleBar from "@/components/TitleBar.vue";
 import ConversationList from "@/components/ConversationList.vue";
 import ChatWindow from "@/components/ChatWindow.vue";
 import FriendProfile from "@/components/FriendProfile.vue";
@@ -70,7 +71,11 @@ onUnmounted(() => window.removeEventListener("navigate-to-contacts", onNavigateT
 </script>
 
 <template>
-  <div class="flex h-screen w-full overflow-hidden bg-[var(--gosslan-bg)] font-gosslan text-[var(--gosslan-text)]">
+  <div class="flex h-screen w-full flex-col overflow-hidden bg-[var(--gosslan-bg)] font-gosslan text-[var(--gosslan-text)]">
+    <!-- 自绘标题栏（桌面端）：与页面同色融合，拖动窗口 -->
+    <TitleBar />
+
+    <div class="flex min-h-0 flex-1 overflow-hidden">
     <!-- 左导航（桌面） -->
     <NavRail :view="view" @update:view="view = $event" @open-settings="openSettings" />
 
@@ -114,6 +119,7 @@ onUnmounted(() => window.removeEventListener("navigate-to-contacts", onNavigateT
         </div>
       </div>
     </main>
+    </div>
 
     <!-- 移动端底部导航 -->
     <nav
