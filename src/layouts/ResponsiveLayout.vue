@@ -127,19 +127,35 @@ onUnmounted(() => window.removeEventListener("navigate-to-contacts", onNavigateT
       class="safe-bottom fixed bottom-0 left-0 right-0 z-40 flex items-center justify-around border-t border-[var(--gosslan-border)] bg-[var(--gosslan-panel)]"
     >
       <button
-        class="flex flex-1 flex-col items-center gap-0.5 py-2.5"
+        class="relative flex flex-1 flex-col items-center gap-0.5 py-2.5"
         :class="view === 'chats' && app.mobileView === 'list' ? 'text-primary' : 'text-[var(--gosslan-text-2)]'"
         @click="app.mobileView = 'list'; view = 'chats'"
       >
-        <MessageCircle class="h-5 w-5" />
+        <span class="relative">
+          <MessageCircle class="h-5 w-5" />
+          <span
+            v-if="chat.totalUnread > 0"
+            class="absolute -right-2.5 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium text-white"
+          >
+            {{ chat.totalUnread > 99 ? "99+" : chat.totalUnread }}
+          </span>
+        </span>
         <span class="text-[10px]">消息</span>
       </button>
       <button
-        class="flex flex-1 flex-col items-center gap-0.5 py-2.5"
+        class="relative flex flex-1 flex-col items-center gap-0.5 py-2.5"
         :class="view === 'contacts' && app.mobileView === 'list' ? 'text-primary' : 'text-[var(--gosslan-text-2)]'"
         @click="app.mobileView = 'list'; view = 'contacts'"
       >
-        <Users class="h-5 w-5" />
+        <span class="relative">
+          <Users class="h-5 w-5" />
+          <span
+            v-if="chat.pendingRequests.length"
+            class="absolute -right-2.5 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium text-white"
+          >
+            {{ chat.pendingRequests.length > 99 ? "99+" : chat.pendingRequests.length }}
+          </span>
+        </span>
         <span class="text-[10px]">联系人</span>
       </button>
       <button
