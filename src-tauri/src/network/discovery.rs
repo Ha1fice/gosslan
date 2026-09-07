@@ -72,14 +72,19 @@ fn score_candidate(ip: &Ipv4Addr, name: &str, has_broadcast: bool) -> i32 {
     score
 }
 
-/// 自动模式下检测最佳 LAN 网卡 IP。
+/// 自动模式下检测最佳 LAN 网卡（IP + broadcast 地址）。
 ///
 /// 使用评分函数而非「第一个匹配就返回」：即使系统上存在多个有 broadcast 的
 /// 接口（Docker bridge / VMware / 真实 LAN），评分机制也能稳定选出真实 LAN，
 /// 且结果不依赖 `get_if_addrs()` 的返回顺序。
-fn find_lan_interface_ip() -> Option<Ipv4Addr> {
+///
+/// 返回 `(lan_ip, broadcast_addr)`：
+/// - `lan_ip`：用于 `IP_MULTICAST_IF`（强制组播出口）和 `join_multicast_v4`
+/// - `broadcast_addr`：用于将 UDP 广播发到精确子网地址（如 `192.168.1.255`），
+///   而非 `255.255.255.255`，确保广播不会因默认路由进入 VPN 适配器
+fn find_lan_interface() -> Option<(Ipv4Addr, Ipv4Addr)> {
     let ifs = if_addrs::get_if_addrs().ok()?;
-    let mut best: Option<(Ipv4Addr, i32)> = None;
+    let mut best: Option<(Ipv4Addr, Ipv4Addr, i32)> = None;
     for i in &ifs {
         if let if_addrs::IfAddr::V4(v4) = &i.addr {
             let ip = match i.ip() {
@@ -91,15 +96,15 @@ fn find_lan_interface_ip() -> Option<Ipv4Addr> {
             }
             let has_broadcast = v4.broadcast.is_some();
             let score = score_candidate(&ip, &i.name, has_broadcast);
-            match &best {
-                None => best = Some((ip, score)),
-                Some((_, prev_score)) if score > *prev_score => best = Some((ip, score)),
-                _ => {}
+            if let Some(bc) = v4.broadcast {
+                if score > best.as_ref().map_or(i32::MIN, |(_, _, s)| *s) {
+                    best = Some((ip, bc, score));
+                }
             }
         }
     }
     // 只接受正分候选（有 broadcast + 非虚拟名 + 非虚拟地址 = 至少 +10 分）
-    best.filter(|(_, s)| *s > 0).map(|(ip, _)| ip)
+    best.filter(|(_, _, s)| *s > 0).map(|(ip, bc, _)| (ip, bc))
 }
 
 fn now_ms() -> i64 {
@@ -111,7 +116,10 @@ fn now_ms() -> i64 {
 
 /// 绑定一个允许地址复用的 UDP 套接字（SO_REUSEADDR + SO_BROADCAST + unix 下 SO_REUSEPORT），
 /// 使同一台机器上的多个 gosslan 实例能同时监听同一发现端口（Windows/macOS/Linux 通用）。
-fn bind_udp_reusable(ip: Ipv4Addr, port: u16) -> Result<UdpSocket, String> {
+///
+/// `multicast_if`：自动模式下传入真实 LAN 接口 IP，设置 `IP_MULTICAST_IF`，
+/// 强制组播报文从该接口发出，避免走默认路由进入 VPN 适配器。
+fn bind_udp_reusable(ip: Ipv4Addr, port: u16, multicast_if: Option<Ipv4Addr>) -> Result<UdpSocket, String> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::SocketAddr;
 
@@ -126,6 +134,11 @@ fn bind_udp_reusable(ip: Ipv4Addr, port: u16) -> Result<UdpSocket, String> {
     #[cfg(unix)]
     sock.set_reuse_port(true).map_err(|e| e.to_string())?;
     sock.set_broadcast(true).map_err(|e| e.to_string())?;
+    // 设置组播出口接口：自动模式下强制走真实 LAN，避免组播被 VPN 默认路由劫持。
+    // 仅影响发送，不影响接收（接收由 join_multicast_v4 控制）。
+    if let Some(iface) = multicast_if {
+        sock.set_multicast_if_v4(&iface).ok();
+    }
     // tokio 要求注册进 runtime 的 fd 必须非阻塞：socket2 创建的是阻塞 socket，
     // 直接 from_std 在 debug 构建会 panic（tokio blocking check），release 构建虽不 panic
     // 但阻塞 fd 挂在 kqueue/epoll 上会卡死 worker 线程（界面卡顿的帮凶之一）。
@@ -158,16 +171,19 @@ pub async fn spawn(
     shutdown: watch::Receiver<bool>,
     mut probe: watch::Receiver<u64>,
 ) -> Result<(), String> {
+    // 自动模式下检测真实 LAN 网卡：获取 IP（用于 IP_MULTICAST_IF）和 broadcast 地址（用于精确广播）
+    let (multicast_if, lan_broadcast) = if ip.is_unspecified() {
+        find_lan_interface().map_or((None, None), |(lan_ip, lan_bc)| (Some(lan_ip), Some(lan_bc)))
+    } else {
+        (None, None) // 手动模式：用指定 IP，不额外设置 multicast 接口
+    };
+
     // 绑定 UDP 端口（SO_REUSEADDR 允许同一台机器上多个 gosslan 实例共存，用于多开测试）
-    let socket = bind_udp_reusable(ip, UDP_PORT)
+    let socket = bind_udp_reusable(ip, UDP_PORT, multicast_if)
         .map_err(|e| format!("UDP 绑定 {ip}:{UDP_PORT} 失败: {e}"))?;
     // 加入组播组：自动模式下显式使用真实 LAN 接口，
     // 避免内核将组播组加到 Clash tun 等虚拟接口上（macOS 上尤其明显）。
-    let multicast_iface = if ip.is_unspecified() {
-        find_lan_interface_ip().unwrap_or(Ipv4Addr::UNSPECIFIED)
-    } else {
-        ip
-    };
+    let multicast_iface = multicast_if.unwrap_or(Ipv4Addr::UNSPECIFIED);
     socket.join_multicast_v4(MULTICAST_GROUP, multicast_iface).ok();
     let socket = Arc::new(socket);
 
@@ -231,23 +247,24 @@ pub async fn spawn(
     {
         let socket = socket.clone();
         let state = state.clone();
+        let lan_broadcast = lan_broadcast;
         let mut shutdown = shutdown.clone();
         tokio::spawn(async move {
             // 首次立刻广播
-            broadcast(&socket, &state, tcp_port).await;
+            broadcast(&socket, &state, tcp_port, lan_broadcast).await;
             // 下一轮周期广播的时刻。只在真正广播后重算，探测分支不改变节拍。
             let mut next_at = Instant::now() + Duration::from_secs(next_wait(&state));
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     _ = sleep_until(next_at) => {
-                        broadcast(&socket, &state, tcp_port).await;
+                        broadcast(&socket, &state, tcp_port, lan_broadcast).await;
                         sweep_peers(&state);
                         next_at = Instant::now() + Duration::from_secs(next_wait(&state));
                     }
                     // 按需探测：用户打开「添加好友」时触发一次 who_has 群发
                     _ = probe.changed() => {
-                        broadcast_probe(&socket, &state, tcp_port).await;
+                        broadcast_probe(&socket, &state, tcp_port, lan_broadcast).await;
                     }
                 }
             }
@@ -278,19 +295,24 @@ fn adaptive_interval(node_count: usize) -> u64 {
     base + jitter / 1000
 }
 
-async fn broadcast(socket: &UdpSocket, state: &AppState, tcp_port: u16) {
+async fn broadcast(socket: &UdpSocket, state: &AppState, tcp_port: u16, lan_broadcast: Option<Ipv4Addr>) {
     let pkt = announce_packet(state, tcp_port);
     let Ok(data) = serde_json::to_vec(&pkt) else {
         return;
     };
-    // 广播 + 组播双通道
-    let _ = socket.send_to(&data, format!("255.255.255.255:{UDP_PORT}")).await;
+    // 广播：优先发到精确子网地址（如 192.168.1.255），确保走正确接口；
+    // 无 LAN 信息时回退 255.255.255.255（所有广播接口）。
+    let bc_addr = lan_broadcast.map_or_else(
+        || format!("255.255.255.255:{UDP_PORT}"),
+        |bc| format!("{bc}:{UDP_PORT}"),
+    );
+    let _ = socket.send_to(&data, &bc_addr).await;
     let _ = socket.send_to(&data, format!("{MULTICAST_GROUP}:{UDP_PORT}")).await;
 }
 
 /// 按需探测：群发 `who_has` 请求周围节点单播回复其 `announce`，并同时广播一次自身 announce。
 /// 用于「添加好友」弹窗打开时快速、主动地发现局域网内在线客户端。
-async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16) {
+async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16, lan_broadcast: Option<Ipv4Addr>) {
     let who = UdpPacket {
         kind: "who_has".to_string(),
         device_id: state.device_id.clone(),
@@ -302,11 +324,15 @@ async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16) {
         ts: now_ms(),
     };
     if let Ok(data) = serde_json::to_vec(&who) {
-        let _ = socket.send_to(&data, format!("255.255.255.255:{UDP_PORT}")).await;
+        let bc_addr = lan_broadcast.map_or_else(
+            || format!("255.255.255.255:{UDP_PORT}"),
+            |bc| format!("{bc}:{UDP_PORT}"),
+        );
+        let _ = socket.send_to(&data, &bc_addr).await;
         let _ = socket.send_to(&data, format!("{MULTICAST_GROUP}:{UDP_PORT}")).await;
     }
     // 同时广播自身，让周围节点也能立刻发现我们
-    broadcast(socket, state, tcp_port).await;
+    broadcast(socket, state, tcp_port, lan_broadcast).await;
 }
 
 /// 清理超过 `PEER_TIMEOUT_SECS` 未活跃的节点，
