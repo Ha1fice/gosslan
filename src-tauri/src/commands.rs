@@ -249,6 +249,85 @@ pub fn get_topology(state: State<'_, Arc<AppState>>) -> TopologyInfo {
     }
 }
 
+// ---------------- 开发者诊断（隐藏面板用，只读不改网络行为） ----------------
+
+/// 获取 Discovery 运行时诊断状态（供隐藏开发者面板展示）。
+#[tauri::command]
+pub fn get_discovery_diag(state: State<'_, Arc<AppState>>) -> crate::state::DiscoveryDiag {
+    let s = state.inner();
+    let net = s.network.lock().unwrap();
+    let diag = s.diag.lock().unwrap().clone();
+    let mut result = diag;
+    if let Some(ref h) = *net {
+        result.mode = if h.bound_ip == "0.0.0.0" { "auto".into() } else { "manual".into() };
+        result.bound_ip = h.bound_ip.clone();
+        result.tcp_listen = format!("{}:{}", h.bound_ip, h.tcp_port);
+        result.udp_port = crate::protocol::UDP_PORT;
+    } else {
+        result.mode = "offline".into();
+    }
+    // 附加最近事件
+    result.recent_events = s.diag_events.lock().unwrap().iter().cloned().collect();
+    result
+}
+
+/// 获取候选网卡列表（含评分），供诊断面板展示 Discovery 自动选择逻辑的实际数据。
+#[tauri::command]
+pub fn get_interface_candidates() -> Vec<crate::state::InterfaceCandidate> {
+    use std::net::Ipv4Addr;
+
+    fn is_virtual_ip(ip: &Ipv4Addr) -> bool {
+        let o = ip.octets();
+        (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+            || (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
+            || (o[0] == 169 && o[1] == 254)
+    }
+    fn is_rfc1918(ip: &Ipv4Addr) -> bool {
+        let o = ip.octets();
+        (o[0] == 10) || (o[0] == 172 && o[1] >= 16 && o[1] <= 31) || (o[0] == 192 && o[1] == 168)
+    }
+    fn is_virtual_name(name: &str) -> bool {
+        let n = name.to_lowercase();
+        ["utun","tun","tap","wg","docker","br-","veth","virbr","vmnet","vboxnet",
+         "hyper-v","hv_","vethernet","cf-","clash","wintun","tailscale","ts-","ham","vpn"]
+            .iter().any(|p| n.contains(p))
+    }
+
+    let mut out = Vec::new();
+    if let Ok(ifs) = if_addrs::get_if_addrs() {
+        for i in &ifs {
+            if let if_addrs::IfAddr::V4(v4) = &i.addr {
+                let ip = match i.ip() {
+                    std::net::IpAddr::V4(v) => v,
+                    _ => continue,
+                };
+                if ip.is_loopback() { continue; }
+                let has_bc = v4.broadcast.is_some();
+                let rfc = is_rfc1918(&ip);
+                let virt_ip = is_virtual_ip(&ip);
+                let virt_name = is_virtual_name(&i.name);
+                let mut score = 0i32;
+                if has_bc { score += 10; }
+                if rfc { score += 5; }
+                if virt_ip { score -= 50; }
+                if virt_name { score -= 30; }
+                out.push(crate::state::InterfaceCandidate {
+                    name: i.name.clone(),
+                    ip: ip.to_string(),
+                    has_broadcast: has_bc,
+                    broadcast: v4.broadcast.map(|b| b.to_string()),
+                    is_rfc1918: rfc,
+                    is_virtual: virt_ip || virt_name,
+                    score,
+                    selected: false, // 由调用方根据实际 bind_ip 设置
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.ip.cmp(&b.ip)));
+    out
+}
+
 // ---------------- 双通道与缓存 ----------------
 
 /// 局域网 / 蓝牙通道状态（设置页开关 + 状态监控）。

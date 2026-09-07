@@ -1,6 +1,6 @@
 //! 应用全局状态与前端交互类型。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,13 @@ use crate::device::{hardware_fingerprint, hostname_fingerprint};
 use crate::gossip_engine::GossipEngine;
 use crate::protocol::{Message, TCP_PORT};
 use crate::relay_manager::RelayManager;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// 局域网在线节点（Peer Table 条目）
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -117,6 +124,65 @@ pub struct InterfaceInfo {
 
 fn default_true() -> bool {
     true
+}
+
+/// 网络接口候选（含评分），供开发者诊断面板展示 Discovery 实际看到的候选列表。
+#[derive(Serialize, Clone, Debug)]
+pub struct InterfaceCandidate {
+    pub name: String,
+    pub ip: String,
+    pub has_broadcast: bool,
+    pub broadcast: Option<String>,
+    pub is_rfc1918: bool,
+    pub is_virtual: bool,
+    pub score: i32,
+    pub selected: bool,
+}
+
+/// Discovery 诊断事件（ring buffer 条目）。
+#[derive(Serialize, Clone, Debug)]
+pub struct DiscoveryEvent {
+    /// 事件发生时的 Unix 毫秒时间戳
+    pub ts: i64,
+    /// 事件类型
+    pub kind: String,
+    /// 简短描述（不含密钥/私密数据，IP 地址可显示）
+    pub detail: String,
+}
+
+/// Discovery 运行时诊断状态（只读，供开发者面板展示）。
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct DiscoveryDiag {
+    /// 当前网络模式：auto / manual / offline
+    pub mode: String,
+    /// 实际绑定的 IP
+    pub bound_ip: String,
+    /// 选中的接口名称（如有）
+    pub selected_interface: String,
+    /// 选中的接口 IP（如有）
+    pub selected_ip: String,
+    /// TCP 监听地址
+    pub tcp_listen: String,
+    /// UDP 发现端口
+    pub udp_port: u16,
+    /// 广播目标地址
+    pub broadcast_target: String,
+    /// 组播地址
+    pub multicast_group: String,
+    /// 组播 join 结果
+    pub multicast_join_result: String,
+    /// set_multicast_if_v4 结果
+    pub multicast_if_result: String,
+    /// 最近一次广播发送时间（ms since epoch，0=从未）
+    pub last_broadcast_send: i64,
+    /// 最近一次组播发送时间
+    pub last_multicast_send: i64,
+    /// 最近一次 announce 接收时间
+    pub last_announce_recv: i64,
+    /// 候选接口列表（含评分）
+    pub candidates: Vec<InterfaceCandidate>,
+    /// 最近事件（ring buffer，最新在末尾）
+    pub recent_events: Vec<DiscoveryEvent>,
 }
 
 /// 网络拓扑摘要（供拓扑状态栏展示）
@@ -228,6 +294,11 @@ pub struct AppState {
     pub peers_notify: Arc<Notify>,
     /// 按需探测触发：值递增 → 发现任务立即群发一次 `who_has`（好友搜索用）
     pub probe: Mutex<Option<watch::Sender<u64>>>,
+
+    /// Discovery 诊断状态（隐藏开发者面板用，只读展示不改变网络行为）
+    pub diag: Mutex<DiscoveryDiag>,
+    /// Discovery 事件 ring buffer（最近 50 条，防无限增长）
+    pub diag_events: Mutex<VecDeque<DiscoveryEvent>>,
 }
 
 impl AppState {
@@ -334,6 +405,8 @@ impl AppState {
             peers_dirty: AtomicBool::new(false),
             peers_notify: Arc::new(Notify::new()),
             probe: Mutex::new(None),
+            diag: Mutex::new(DiscoveryDiag::default()),
+            diag_events: Mutex::new(VecDeque::with_capacity(50)),
         }))
     }
 
@@ -351,6 +424,20 @@ impl AppState {
     fn emit_peers_now(&self) {
         let peers: Vec<Peer> = self.peers.lock().unwrap().values().cloned().collect();
         let _ = self.app.emit("peers-updated", peers);
+    }
+
+    /// 推送一条诊断事件到 ring buffer（最多保留 50 条，淘汰最旧）。
+    pub fn push_diag_event(&self, kind: &str, detail: &str) {
+        let ev = DiscoveryEvent {
+            ts: now_ms(),
+            kind: kind.to_string(),
+            detail: detail.to_string(),
+        };
+        let mut buf = self.diag_events.lock().unwrap();
+        if buf.len() >= 50 {
+            buf.pop_front();
+        }
+        buf.push_back(ev);
     }
 
     /// 启动节点表节流推送任务（合并高频更新，避免 IPC 风暴）。

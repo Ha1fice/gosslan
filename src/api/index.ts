@@ -23,6 +23,8 @@ import type {
   ShareEntry,
   TopologyInfo,
   TransferInfo,
+  DiscoveryDiag,
+  InterfaceCandidate,
 } from "@/types";
 
 export const api = {
@@ -93,6 +95,10 @@ export const api = {
   broadcastChatStyle: (style: string) => invoke<void>("broadcast_chat_style", { style }),
   searchMessages: (keyword: string) => invoke<SearchResult[]>("search_messages", { keyword }),
   clearAllData: () => invoke<void>("clear_all_data"),
+
+  // 开发者诊断（隐藏面板用）
+  getDiscoveryDiag: () => invoke<DiscoveryDiag>("get_discovery_diag"),
+  getInterfaceCandidates: () => invoke<InterfaceCandidate[]>("get_interface_candidates"),
 };
 
 // ---------------- 事件监听 ----------------

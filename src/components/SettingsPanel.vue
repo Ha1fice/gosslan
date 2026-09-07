@@ -5,6 +5,7 @@ import { useAppStore } from "@/stores/useAppStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { api } from "@/api";
 import BaseModal from "@/components/BaseModal.vue";
+import DevDiagPanel from "@/components/DevDiagPanel.vue";
 import {
   Bluetooth,
   FolderOpen,
@@ -26,6 +27,21 @@ const emit = defineEmits<{ (e: "close"): void }>();
 
 const app = useAppStore();
 const chat = useChatStore();
+
+// 隐藏开发者诊断面板：连续点击设备指纹 7 次（2.5 秒窗口）
+const devTapCount = ref(0);
+const devTapTimer = ref<ReturnType<typeof setTimeout> | null>(null);
+const devDiagOpen = ref(false);
+function onFingerprintTap() {
+  devTapCount.value++;
+  if (devTapTimer.value) clearTimeout(devTapTimer.value);
+  devTapTimer.value = setTimeout(() => { devTapCount.value = 0; }, 2500);
+  if (devTapCount.value >= 7) {
+    devTapCount.value = 0;
+    if (devTapTimer.value) { clearTimeout(devTapTimer.value); devTapTimer.value = null; }
+    devDiagOpen.value = true;
+  }
+}
 
 const nickname = ref(app.device?.nickname ?? "");
 const avatar = ref<string | null>(app.device?.avatar ?? null);
@@ -589,7 +605,7 @@ async function clearAllDataConfirm() {
       <section>
         <h3 class="mb-3 text-[13px] font-semibold text-[var(--gosslan-text)]">关于</h3>
         <div class="text-xs leading-relaxed text-[var(--gosslan-text-2)]">
-          设备指纹：<span class="break-all font-mono select-text">{{ fullId }}</span>
+          设备指纹：<span class="break-all font-mono select-text" @click="onFingerprintTap">{{ fullId }}</span>
         </div>
         <div class="mt-1 text-xs text-[var(--gosslan-text-2)]">
           Gosslan v{{ version }} · 无服务器 P2P · 端到端加密 · 数据仅存本机
@@ -618,4 +634,7 @@ async function clearAllDataConfirm() {
       </button>
     </div>
   </BaseModal>
+
+  <!-- 开发者诊断面板（隐藏入口：连续点击设备指纹 7 次） -->
+  <DevDiagPanel :open="devDiagOpen" @close="devDiagOpen = false" />
 </template>

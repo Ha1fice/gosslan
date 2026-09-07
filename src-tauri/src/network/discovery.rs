@@ -119,7 +119,7 @@ fn now_ms() -> i64 {
 ///
 /// `multicast_if`：自动模式下传入真实 LAN 接口 IP，设置 `IP_MULTICAST_IF`，
 /// 强制组播报文从该接口发出，避免走默认路由进入 VPN 适配器。
-fn bind_udp_reusable(ip: Ipv4Addr, port: u16, multicast_if: Option<Ipv4Addr>) -> Result<UdpSocket, String> {
+fn bind_udp_reusable(ip: Ipv4Addr, port: u16, multicast_if: Option<Ipv4Addr>) -> Result<(UdpSocket, String), String> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::SocketAddr;
 
@@ -136,9 +136,14 @@ fn bind_udp_reusable(ip: Ipv4Addr, port: u16, multicast_if: Option<Ipv4Addr>) ->
     sock.set_broadcast(true).map_err(|e| e.to_string())?;
     // 设置组播出口接口：自动模式下强制走真实 LAN，避免组播被 VPN 默认路由劫持。
     // 仅影响发送，不影响接收（接收由 join_multicast_v4 控制）。
-    if let Some(iface) = multicast_if {
-        sock.set_multicast_if_v4(&iface).ok();
-    }
+    let multicast_if_result = if let Some(iface) = multicast_if {
+        match sock.set_multicast_if_v4(&iface) {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("error: {e}"),
+        }
+    } else {
+        "not_set".into()
+    };
     // tokio 要求注册进 runtime 的 fd 必须非阻塞：socket2 创建的是阻塞 socket，
     // 直接 from_std 在 debug 构建会 panic（tokio blocking check），release 构建虽不 panic
     // 但阻塞 fd 挂在 kqueue/epoll 上会卡死 worker 线程（界面卡顿的帮凶之一）。
@@ -147,7 +152,8 @@ fn bind_udp_reusable(ip: Ipv4Addr, port: u16, multicast_if: Option<Ipv4Addr>) ->
     sock.bind(&sock_addr).map_err(|e| e.to_string())?;
 
     let std_sock: std::net::UdpSocket = sock.into();
-    UdpSocket::from_std(std_sock).map_err(|e| e.to_string())
+    let tokio_sock = UdpSocket::from_std(std_sock).map_err(|e| e.to_string())?;
+    Ok((tokio_sock, multicast_if_result))
 }
 
 fn announce_packet(state: &AppState, tcp_port: u16) -> UdpPacket {
@@ -179,13 +185,45 @@ pub async fn spawn(
     };
 
     // 绑定 UDP 端口（SO_REUSEADDR 允许同一台机器上多个 gosslan 实例共存，用于多开测试）
-    let socket = bind_udp_reusable(ip, UDP_PORT, multicast_if)
+    let (socket, multicast_if_result) = bind_udp_reusable(ip, UDP_PORT, multicast_if)
         .map_err(|e| format!("UDP 绑定 {ip}:{UDP_PORT} 失败: {e}"))?;
     // 加入组播组：自动模式下显式使用真实 LAN 接口，
     // 避免内核将组播组加到 Clash tun 等虚拟接口上（macOS 上尤其明显）。
     let multicast_iface = multicast_if.unwrap_or(Ipv4Addr::UNSPECIFIED);
-    socket.join_multicast_v4(MULTICAST_GROUP, multicast_iface).ok();
+    let join_res = socket.join_multicast_v4(MULTICAST_GROUP, multicast_iface);
+    // 记录诊断：组播 join 结果（不改变行为，.ok() 仍然在下面）
+    let join_msg = match &join_res {
+        Ok(()) => "ok".into(),
+        Err(e) => format!("error: {e}"),
+    };
+    join_res.ok();
     let socket = Arc::new(socket);
+
+    // 记录诊断：启动参数
+    {
+        let mut diag = state.diag.lock().unwrap();
+        diag.broadcast_target = "255.255.255.255".into();
+        diag.multicast_group = format!("{MULTICAST_GROUP}");
+        diag.multicast_join_result = join_msg;
+        diag.multicast_if_result = multicast_if_result;
+        diag.udp_port = UDP_PORT;
+        if let Some(mif) = multicast_if {
+            diag.selected_ip = mif.to_string();
+        }
+        diag.selected_interface = multicast_if
+            .and_then(|mip| {
+                if_addrs::get_if_addrs().ok()?.into_iter().find_map(|i| {
+                    if let if_addrs::IfAddr::V4(v4) = &i.addr {
+                        if i.ip() == std::net::IpAddr::V4(mip) {
+                            return Some(i.name.clone());
+                        }
+                    }
+                    None
+                })
+            })
+            .unwrap_or_default();
+    }
+    state.push_diag_event("discovery_started", &format!("bind={ip}, multicast_iface={multicast_iface}"));
 
     let my_id = state.device_id.clone();
 
@@ -213,6 +251,7 @@ pub async fn spawn(
                         }
                         match pkt.kind.as_str() {
                             "announce" => {
+                                state.push_diag_event("announce_recv", &format!("from={} via={}", pkt.device_id, src.ip()));
                                 // 粗略 RTT：基于双方 NTP 同步时钟的时间差（局域网内近似）
                                 let delta = now_ms().saturating_sub(pkt.ts);
                                 let rtt = if delta > 0 && delta < 5000 { Some(delta as u64) } else { None };
@@ -305,6 +344,7 @@ async fn broadcast(socket: &UdpSocket, state: &AppState, tcp_port: u16, _lan_bro
     // limited broadcast 发送到所有 IFF_BROADCAST 接口，不走默认路由，跨平台可靠。
     let _ = socket.send_to(&data, format!("255.255.255.255:{UDP_PORT}")).await;
     let _ = socket.send_to(&data, format!("{MULTICAST_GROUP}:{UDP_PORT}")).await;
+    state.push_diag_event("broadcast_sent", &format!("target=255.255.255.255:{UDP_PORT}, multicast={MULTICAST_GROUP}:{UDP_PORT}"));
 }
 
 /// 按需探测：群发 `who_has` 请求周围节点单播回复其 `announce`，并同时广播一次自身 announce。
@@ -323,6 +363,7 @@ async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16, _l
     if let Ok(data) = serde_json::to_vec(&who) {
         let _ = socket.send_to(&data, format!("255.255.255.255:{UDP_PORT}")).await;
         let _ = socket.send_to(&data, format!("{MULTICAST_GROUP}:{UDP_PORT}")).await;
+        state.push_diag_event("who_has_sent", &format!("target=255.255.255.255:{UDP_PORT}"));
     }
     // 同时广播自身，让周围节点也能立刻发现我们
     broadcast(socket, state, tcp_port, _lan_broadcast).await;

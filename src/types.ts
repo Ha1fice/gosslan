@@ -170,3 +170,40 @@ export interface SearchResult {
   match_content: string;
   match_ts: number;
 }
+
+// ---------------- Discovery 诊断（隐藏开发者面板用） ----------------
+
+export interface InterfaceCandidate {
+  name: string;
+  ip: string;
+  has_broadcast: boolean;
+  broadcast: string | null;
+  is_rfc1918: boolean;
+  is_virtual: boolean;
+  score: number;
+  selected: boolean;
+}
+
+export interface DiscoveryEvent {
+  ts: number;
+  kind: string;
+  detail: string;
+}
+
+export interface DiscoveryDiag {
+  mode: string;
+  bound_ip: string;
+  selected_interface: string;
+  selected_ip: string;
+  tcp_listen: string;
+  udp_port: number;
+  broadcast_target: string;
+  multicast_group: string;
+  multicast_join_result: string;
+  multicast_if_result: string;
+  last_broadcast_send: number;
+  last_multicast_send: number;
+  last_announce_recv: number;
+  candidates: InterfaceCandidate[];
+  recent_events: DiscoveryEvent[];
+}
