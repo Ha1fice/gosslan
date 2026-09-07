@@ -139,13 +139,17 @@ async fn handle_incoming(state: Arc<AppState>, stream: TcpStream, peer_addr: std
     tokio::spawn(writer_loop(state.clone(), peer_id.clone(), w, rx));
     handle_message(&state, &peer_id, first).await;
     // 用 TCP 对端的真实地址补全 peer IP：解决「被动连接方 peers 表 IP 为空或虚拟」的问题。
-    // 只在当前 IP 为空或为虚拟地址时才更新，避免覆盖已知的真实 LAN IP。
+    // 新地址必须是非虚拟、非 link-local 的可直连 LAN 地址才写入。
     {
         let mut peers = state.peers.lock().unwrap();
         if let Some(p) = peers.get_mut(&peer_id) {
-            let real_ip = peer_addr.ip().to_string();
-            if p.ip.is_empty() || is_virtual_ip_str(&p.ip) {
-                p.ip = real_ip;
+            if let std::net::IpAddr::V4(new_ip) = peer_addr.ip() {
+                let new_ok = !is_virtual_ip(&new_ip)
+                    && new_ip.octets()[0] != 169
+                    && new_ip.octets()[1] != 254;
+                if new_ok && (p.ip.is_empty() || is_virtual_ip_str(&p.ip)) {
+                    p.ip = new_ip.to_string();
+                }
             }
         }
     }

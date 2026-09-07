@@ -132,12 +132,11 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
                 if ip.is_loopback() {
                     continue;
                 }
-                // is_lan：有广播地址（真实 LAN 的标志）+ 非 link-local + 非 VPN 地址段 + 掩码不为 /32
+                // is_lan：有广播地址（真实 LAN 的标志）+ 非 link-local + 非 VPN 地址段
                 let has_broadcast = v4.broadcast.is_some();
                 let is_link_local = ip.octets()[0] == 169 && ip.octets()[1] == 254;
-                let prefix_len: u8 = v4.netmask.octets().iter().map(|b| b.count_ones() as u8).sum();
                 let not_vpn = !is_virtual_ip(&ip);
-                let is_lan = has_broadcast && !is_link_local && not_vpn && prefix_len <= 24;
+                let is_lan = has_broadcast && !is_link_local && not_vpn;
                 out.push(InterfaceInfo {
                     name: i.name.clone(),
                     ip: ip.to_string(),

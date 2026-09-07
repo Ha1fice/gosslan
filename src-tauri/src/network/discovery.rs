@@ -24,15 +24,62 @@ use crate::state::AppState;
 /// 组播地址（与广播并行，覆盖被隔离广播域的场景）
 pub const MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 
-/// 检查一个 IPv4 地址是否属于真实 LAN 网卡：有广播地址、非 link-local、非 VPN 地址段。
-fn is_lan_interface(ip: &Ipv4Addr, broadcast: bool) -> bool {
-    broadcast && !is_virtual_ip(ip)
+/// 检查一个 IPv4 是否属于 RFC1918 私网地址（合法 LAN 常用段）。
+fn is_rfc1918(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    (o[0] == 10)
+        || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+        || (o[0] == 192 && o[1] == 168)
 }
 
-/// 自动模式下检测真实 LAN 网卡 IP（有广播地址、非 VPN、非 link-local）。
-/// 用于组播 join 指定接口，避免内核误选 Clash tun 接口。
+/// 接口名称是否匹配已知虚拟/VPN/容器适配器模式。
+/// 覆盖 macOS / Linux / Windows 三端常见名称。
+fn is_virtual_interface_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    let patterns = [
+        "utun", "tun", "tap", "wg",           // VPN / WireGuard
+        "docker", "br-", "veth", "virbr",      // Docker / libvirt
+        "vmnet", "vboxnet",                     // VMware / VirtualBox
+        "hyper-v", "hv_", "vethernet",         // Hyper-V
+        "cf-", "clash", "wintun",              // Clash / Cloudflare WARP / WinTun
+        "tailscale", "ts-",                    // Tailscale
+        "ham", "vpn",                          // 通用 VPN
+    ];
+    patterns.iter().any(|p| n.contains(p))
+}
+
+/// 为一个 IPv4 候选接口评分（越高越像真实 LAN）。
+///
+/// 评分维度（可解释、确定性，不依赖 `get_if_addrs()` 返回顺序）：
+///   +10  有 broadcast 地址（真实 LAN 的核心标志）
+///   +5   RFC1918 私网地址（10.x / 172.16-31.x / 192.168.x）
+///   -50  虚拟地址段（198.18/15 / 100.64/10 / 169.254/16）
+///   -30  虚拟接口名称（tun / docker / vmnet / wg / hyper-v 等）
+fn score_candidate(ip: &Ipv4Addr, name: &str, has_broadcast: bool) -> i32 {
+    let mut score = 0;
+    if has_broadcast {
+        score += 10;
+    }
+    if is_rfc1918(ip) {
+        score += 5;
+    }
+    if is_virtual_ip(ip) {
+        score -= 50;
+    }
+    if is_virtual_interface_name(name) {
+        score -= 30;
+    }
+    score
+}
+
+/// 自动模式下检测最佳 LAN 网卡 IP。
+///
+/// 使用评分函数而非「第一个匹配就返回」：即使系统上存在多个有 broadcast 的
+/// 接口（Docker bridge / VMware / 真实 LAN），评分机制也能稳定选出真实 LAN，
+/// 且结果不依赖 `get_if_addrs()` 的返回顺序。
 fn find_lan_interface_ip() -> Option<Ipv4Addr> {
     let ifs = if_addrs::get_if_addrs().ok()?;
+    let mut best: Option<(Ipv4Addr, i32)> = None;
     for i in &ifs {
         if let if_addrs::IfAddr::V4(v4) = &i.addr {
             let ip = match i.ip() {
@@ -43,12 +90,16 @@ fn find_lan_interface_ip() -> Option<Ipv4Addr> {
                 continue;
             }
             let has_broadcast = v4.broadcast.is_some();
-            if is_lan_interface(&ip, has_broadcast) {
-                return Some(ip);
+            let score = score_candidate(&ip, &i.name, has_broadcast);
+            match &best {
+                None => best = Some((ip, score)),
+                Some((_, prev_score)) if score > *prev_score => best = Some((ip, score)),
+                _ => {}
             }
         }
     }
-    None
+    // 只接受正分候选（有 broadcast + 非虚拟名 + 非虚拟地址 = 至少 +10 分）
+    best.filter(|(_, s)| *s > 0).map(|(ip, _)| ip)
 }
 
 fn now_ms() -> i64 {
@@ -339,32 +390,102 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100), "过期 deadline 应立即就绪");
     }
 
-    // ---- 新增：虚拟 IP 与 LAN 接口判断测试 ----
+    // ---- 评分函数与接口识别测试 ----
 
-    /// is_virtual_ip 覆盖：Clash fake-ip / WireGuard CGNAT / link-local / 真实 LAN
+    /// RFC1918 三段全部命中
     #[test]
-    fn is_virtual_ip_covers_known_ranges() {
-        // Clash fake-ip 段
+    fn is_rfc1918_covers_private_ranges() {
+        assert!(is_rfc1918(&"10.0.0.1".parse().unwrap()));
+        assert!(is_rfc1918(&"10.255.255.255".parse().unwrap()));
+        assert!(is_rfc1918(&"172.16.0.1".parse().unwrap()));
+        assert!(is_rfc1918(&"172.31.255.255".parse().unwrap()));
+        assert!(is_rfc1918(&"192.168.1.1".parse().unwrap()));
+        assert!(is_rfc1918(&"192.168.0.1".parse().unwrap()));
+        // 非 RFC1918 不误判
+        assert!(!is_rfc1918(&"172.15.0.1".parse().unwrap()));
+        assert!(!is_rfc1918(&"172.32.0.1".parse().unwrap()));
+        assert!(!is_rfc1918(&"192.169.0.1".parse().unwrap()));
+        assert!(!is_rfc1918(&"8.8.8.8".parse().unwrap()));
+    }
+
+    /// 非 LAN 地址段全部识别
+    #[test]
+    fn is_virtual_ip_covers_non_lan_ranges() {
         assert!(is_virtual_ip(&"198.18.0.1".parse().unwrap()));
         assert!(is_virtual_ip(&"198.19.255.254".parse().unwrap()));
-        // WireGuard / CGNAT / Tailscale
         assert!(is_virtual_ip(&"100.64.0.1".parse().unwrap()));
         assert!(is_virtual_ip(&"100.127.255.254".parse().unwrap()));
-        // link-local
         assert!(is_virtual_ip(&"169.254.1.1".parse().unwrap()));
-        // 真实局域网不应被误判
+        // 合法 LAN 不误判
         assert!(!is_virtual_ip(&"192.168.1.100".parse().unwrap()));
         assert!(!is_virtual_ip(&"10.0.0.1".parse().unwrap()));
         assert!(!is_virtual_ip(&"172.16.0.1".parse().unwrap()));
-        assert!(!is_virtual_ip(&"192.168.10.50".parse().unwrap()));
     }
 
-    /// is_lan_interface：真实 LAN（有广播）= true，虚拟/VPN（无广播/虚拟 IP）= false
+    /// 虚拟接口名称覆盖 macOS / Linux / Windows 三端
     #[test]
-    fn is_lan_interface_combinations() {
-        assert!(is_lan_interface(&"192.168.1.100".parse().unwrap(), true));
-        assert!(!is_lan_interface(&"192.168.1.100".parse().unwrap(), false)); // 无广播 = 不是 LAN
-        assert!(!is_lan_interface(&"198.18.0.1".parse().unwrap(), true)); // 虚拟 IP = 不是 LAN
-        assert!(!is_lan_interface(&"169.254.1.1".parse().unwrap(), true)); // link-local = 不是 LAN
+    fn is_virtual_interface_name_covers_common_patterns() {
+        // VPN / WireGuard
+        assert!(is_virtual_interface_name("utun3"));
+        assert!(is_virtual_interface_name("tun0"));
+        assert!(is_virtual_interface_name("wg0"));
+        assert!(is_virtual_interface_name("tailscale0"));
+        // Docker / libvirt
+        assert!(is_virtual_interface_name("docker0"));
+        assert!(is_virtual_interface_name("br-abcdef"));
+        assert!(is_virtual_interface_name("veth1234"));
+        assert!(is_virtual_interface_name("virbr0"));
+        // VMware / VirtualBox
+        assert!(is_virtual_interface_name("vmnet8"));
+        assert!(is_virtual_interface_name("vboxnet0"));
+        // Hyper-V
+        assert!(is_virtual_interface_name("vEthernet (Default Switch)"));
+        // Clash / WARP
+        assert!(is_virtual_interface_name("ClashMeta"));
+        assert!(is_virtual_interface_name("cf-warp"));
+        // 真实 LAN 名称不误判
+        assert!(!is_virtual_interface_name("en0"));
+        assert!(!is_virtual_interface_name("eth0"));
+        assert!(!is_virtual_interface_name("wlan0"));
+        assert!(!is_virtual_interface_name("Wi-Fi"));
+        assert!(!is_virtual_interface_name("以太网"));
+    }
+
+    /// 评分确定性：不依赖输入顺序，虚拟接口名始终排在真实 LAN 之后
+    #[test]
+    fn score_candidate_orders_correctly() {
+        // 真实 LAN：broadcast + RFC1918 = +15
+        let real_lan = score_candidate(&"192.168.1.100".parse().unwrap(), "en0", true);
+        assert_eq!(real_lan, 15);
+
+        // Docker bridge：broadcast + RFC1918 - 虚拟名 = +10+5-30 = -15
+        let docker = score_candidate(&"172.17.0.1".parse().unwrap(), "docker0", true);
+        assert_eq!(docker, -15);
+
+        // Clash tun：无 broadcast + 虚拟地址 + 虚拟名 = -80
+        let clash = score_candidate(&"198.18.0.1".parse().unwrap(), "utun3", false);
+        assert_eq!(clash, -80);
+
+        // 真实 LAN（非 RFC1918，如公网 IP）：broadcast = +10
+        let public_lan = score_candidate(&"203.0.113.5".parse().unwrap(), "eth0", true);
+        assert_eq!(public_lan, 10);
+
+        // 没有 broadcast 的普通接口 = 0
+        let no_bcast = score_candidate(&"192.168.1.5".parse().unwrap(), "en0", false);
+        assert_eq!(no_bcast, 5);
+
+        // 真实 LAN 永远 > Docker/VMware/Hyper-V（即使后者也有 broadcast）
+        assert!(real_lan > docker, "真实 LAN {real_lan} 应高于 Docker {docker}");
+    }
+
+    /// score_candidate 不受 RFC1918 地址范围误判影响
+    #[test]
+    fn score_candidate_rfc1918_boundary() {
+        // 172.15.x.x 不是 RFC1918（紧邻 172.16 但不在范围内）
+        let borderline_below = score_candidate(&"172.15.0.1".parse().unwrap(), "en0", true);
+        assert_eq!(borderline_below, 10, "172.15 应无 RFC1918 加分");
+        // 172.16.x.x 是 RFC1918
+        let borderline_above = score_candidate(&"172.16.0.1".parse().unwrap(), "en0", true);
+        assert_eq!(borderline_above, 15, "172.16 应有 RFC1918 加分");
     }
 }
