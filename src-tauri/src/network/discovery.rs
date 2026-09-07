@@ -295,24 +295,21 @@ fn adaptive_interval(node_count: usize) -> u64 {
     base + jitter / 1000
 }
 
-async fn broadcast(socket: &UdpSocket, state: &AppState, tcp_port: u16, lan_broadcast: Option<Ipv4Addr>) {
+async fn broadcast(socket: &UdpSocket, state: &AppState, tcp_port: u16, _lan_broadcast: Option<Ipv4Addr>) {
     let pkt = announce_packet(state, tcp_port);
     let Ok(data) = serde_json::to_vec(&pkt) else {
         return;
     };
-    // 广播：优先发到精确子网地址（如 192.168.1.255），确保走正确接口；
-    // 无 LAN 信息时回退 255.255.255.255（所有广播接口）。
-    let bc_addr = lan_broadcast.map_or_else(
-        || format!("255.255.255.255:{UDP_PORT}"),
-        |bc| format!("{bc}:{UDP_PORT}"),
-    );
-    let _ = socket.send_to(&data, &bc_addr).await;
+    // 广播使用 limited broadcast（255.255.255.255）：Windows 默认禁用 directed broadcast
+    // （DisableDirectedBroadcasts=1），精确子网地址会被内核静默丢弃。
+    // limited broadcast 发送到所有 IFF_BROADCAST 接口，不走默认路由，跨平台可靠。
+    let _ = socket.send_to(&data, format!("255.255.255.255:{UDP_PORT}")).await;
     let _ = socket.send_to(&data, format!("{MULTICAST_GROUP}:{UDP_PORT}")).await;
 }
 
 /// 按需探测：群发 `who_has` 请求周围节点单播回复其 `announce`，并同时广播一次自身 announce。
 /// 用于「添加好友」弹窗打开时快速、主动地发现局域网内在线客户端。
-async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16, lan_broadcast: Option<Ipv4Addr>) {
+async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16, _lan_broadcast: Option<Ipv4Addr>) {
     let who = UdpPacket {
         kind: "who_has".to_string(),
         device_id: state.device_id.clone(),
@@ -324,15 +321,11 @@ async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16, la
         ts: now_ms(),
     };
     if let Ok(data) = serde_json::to_vec(&who) {
-        let bc_addr = lan_broadcast.map_or_else(
-            || format!("255.255.255.255:{UDP_PORT}"),
-            |bc| format!("{bc}:{UDP_PORT}"),
-        );
-        let _ = socket.send_to(&data, &bc_addr).await;
+        let _ = socket.send_to(&data, format!("255.255.255.255:{UDP_PORT}")).await;
         let _ = socket.send_to(&data, format!("{MULTICAST_GROUP}:{UDP_PORT}")).await;
     }
     // 同时广播自身，让周围节点也能立刻发现我们
-    broadcast(socket, state, tcp_port, lan_broadcast).await;
+    broadcast(socket, state, tcp_port, _lan_broadcast).await;
 }
 
 /// 清理超过 `PEER_TIMEOUT_SECS` 未活跃的节点，
