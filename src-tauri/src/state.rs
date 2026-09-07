@@ -109,6 +109,14 @@ pub struct DeviceInfo {
 pub struct InterfaceInfo {
     pub name: String,
     pub ip: String,
+    /// 是否为真实局域网卡（有广播地址、非 link-local、非 VPN 虚拟地址）。
+    /// false 表示疑似 VPN / Clash / tun / tap 等虚拟网卡。
+    #[serde(default = "default_true")]
+    pub is_lan: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 网络拓扑摘要（供拓扑状态栏展示）

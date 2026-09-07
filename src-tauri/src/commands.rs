@@ -1,5 +1,6 @@
 //! Tauri 命令层：前端调用的所有后端入口。
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,18 +105,44 @@ pub async fn update_profile(
     })
 }
 
+/// 判断 IPv4 是否为常见 VPN / Clash / 虚拟网卡地址段。
+///
+/// 保守策略：只过滤**几乎不可能出现在真实局域网**的地址段；
+/// 10.x.x.x 等模糊段不纳入过滤（真实 LAN 广泛使用 10/8）。
+pub fn is_virtual_ip(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    // 198.18.0.0/15 — Clash / sing-box / v2ray fake-ip 段
+    (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+    // 100.64.0.0/10 — WireGuard / CGNAT / Tailscale 常用段
+    || (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
+    // 169.254.0.0/16 — link-local
+    || (o[0] == 169 && o[1] == 254)
+}
+
 #[tauri::command]
 pub fn list_interfaces() -> Vec<InterfaceInfo> {
     let mut out = Vec::new();
     if let Ok(ifs) = if_addrs::get_if_addrs() {
-        for i in ifs {
-            if let std::net::IpAddr::V4(ip) = i.addr.ip() {
-                if !ip.is_loopback() {
-                    out.push(InterfaceInfo {
-                        name: i.name.clone(),
-                        ip: ip.to_string(),
-                    });
+        for i in &ifs {
+            if let if_addrs::IfAddr::V4(v4) = &i.addr {
+                let ip = match i.ip() {
+                    std::net::IpAddr::V4(v) => v,
+                    _ => continue,
+                };
+                if ip.is_loopback() {
+                    continue;
                 }
+                // is_lan：有广播地址（真实 LAN 的标志）+ 非 link-local + 非 VPN 地址段 + 掩码不为 /32
+                let has_broadcast = v4.broadcast.is_some();
+                let is_link_local = ip.octets()[0] == 169 && ip.octets()[1] == 254;
+                let prefix_len: u8 = v4.netmask.octets().iter().map(|b| b.count_ones() as u8).sum();
+                let not_vpn = !is_virtual_ip(&ip);
+                let is_lan = has_broadcast && !is_link_local && not_vpn && prefix_len <= 24;
+                out.push(InterfaceInfo {
+                    name: i.name.clone(),
+                    ip: ip.to_string(),
+                    is_lan,
+                });
             }
         }
     }
@@ -417,10 +444,17 @@ pub async fn broadcast_chat_style(state: State<'_, Arc<AppState>>, style: String
 pub fn get_friends(state: State<'_, Arc<AppState>>) -> Vec<Friend> {
     let s = state.inner();
     let peers = s.peers.lock().unwrap();
+    // 同时检查活跃 TCP 链接：链路存活但 peer 已被 discovery sweep 清掉时，
+    // 仍应显示在线，避免「实际可通信但 UI 显示离线」。
+    let active_links: std::collections::HashSet<String> = s
+        .links
+        .try_lock()
+        .map(|l| l.keys().cloned().collect())
+        .unwrap_or_default();
     let dbc = s.db.lock().unwrap();
     let mut friends = db::list_friends(&dbc).unwrap_or_default();
     for f in friends.iter_mut() {
-        f.online = peers.contains_key(&f.device_id);
+        f.online = peers.contains_key(&f.device_id) || active_links.contains(&f.device_id);
     }
     friends
 }

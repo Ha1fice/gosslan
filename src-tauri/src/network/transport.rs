@@ -18,11 +18,20 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use x25519_dalek::StaticSecret;
 
+use crate::commands::is_virtual_ip;
 use crate::crypto;
 use crate::db;
 use crate::network::file;
 use crate::protocol::{GossipEnvelope, GossipKind, Message, MsgKind, MAX_FRAME};
 use crate::state::{AppState, FileDoneInfo, FileProgress, MessageRecord, Peer, PendingRequest};
+
+/// 字符串 IP 是否为虚拟地址（用于 peers 表中已存储的 IP 字符串判断）。
+fn is_virtual_ip_str(ip_str: &str) -> bool {
+    ip_str
+        .parse::<Ipv4Addr>()
+        .map(|ip| is_virtual_ip(&ip))
+        .unwrap_or(false)
+}
 
 // ---------------- 分帧 ----------------
 
@@ -86,9 +95,9 @@ pub async fn spawn(
             tokio::select! {
                 _ = shutdown.changed() => break,
                 accept = listener.accept() => {
-                    let Ok((stream, _addr)) = accept else { continue };
+                    let Ok((stream, peer_addr)) = accept else { continue };
                     let st = state.clone();
-                    tokio::spawn(handle_incoming(st, stream));
+                    tokio::spawn(handle_incoming(st, stream, peer_addr));
                 }
             }
         }
@@ -115,7 +124,7 @@ pub async fn spawn(
     Ok(())
 }
 
-async fn handle_incoming(state: Arc<AppState>, stream: TcpStream) {
+async fn handle_incoming(state: Arc<AppState>, stream: TcpStream, peer_addr: std::net::SocketAddr) {
     let (mut r, w) = stream.into_split();
     let first = match read_frame(&mut r).await {
         Ok(m) => m,
@@ -129,6 +138,18 @@ async fn handle_incoming(state: Arc<AppState>, stream: TcpStream) {
     state.links.lock().await.insert(peer_id.clone(), tx.clone());
     tokio::spawn(writer_loop(state.clone(), peer_id.clone(), w, rx));
     handle_message(&state, &peer_id, first).await;
+    // 用 TCP 对端的真实地址补全 peer IP：解决「被动连接方 peers 表 IP 为空或虚拟」的问题。
+    // 只在当前 IP 为空或为虚拟地址时才更新，避免覆盖已知的真实 LAN IP。
+    {
+        let mut peers = state.peers.lock().unwrap();
+        if let Some(p) = peers.get_mut(&peer_id) {
+            let real_ip = peer_addr.ip().to_string();
+            if p.ip.is_empty() || is_virtual_ip_str(&p.ip) {
+                p.ip = real_ip;
+            }
+        }
+    }
+    state.emit_peers();
     reader_loop(state, r, peer_id, tx).await;
 }
 

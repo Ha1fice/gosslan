@@ -16,12 +16,40 @@ use tokio::time::{sleep_until, Duration, Instant};
 
 use rand_core::{OsRng, RngCore};
 
+use crate::commands::is_virtual_ip;
 use crate::network::transport::{ensure_link, upsert_peer};
 use crate::protocol::{UdpPacket, ANNOUNCE_INTERVAL_SECS, PEER_TIMEOUT_SECS, UDP_PORT};
 use crate::state::AppState;
 
 /// 组播地址（与广播并行，覆盖被隔离广播域的场景）
 pub const MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
+
+/// 检查一个 IPv4 地址是否属于真实 LAN 网卡：有广播地址、非 link-local、非 VPN 地址段。
+fn is_lan_interface(ip: &Ipv4Addr, broadcast: bool) -> bool {
+    broadcast && !is_virtual_ip(ip)
+}
+
+/// 自动模式下检测真实 LAN 网卡 IP（有广播地址、非 VPN、非 link-local）。
+/// 用于组播 join 指定接口，避免内核误选 Clash tun 接口。
+fn find_lan_interface_ip() -> Option<Ipv4Addr> {
+    let ifs = if_addrs::get_if_addrs().ok()?;
+    for i in &ifs {
+        if let if_addrs::IfAddr::V4(v4) = &i.addr {
+            let ip = match i.ip() {
+                std::net::IpAddr::V4(v) => v,
+                _ => continue,
+            };
+            if i.is_loopback() {
+                continue;
+            }
+            let has_broadcast = v4.broadcast.is_some();
+            if is_lan_interface(&ip, has_broadcast) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -82,9 +110,14 @@ pub async fn spawn(
     // 绑定 UDP 端口（SO_REUSEADDR 允许同一台机器上多个 gosslan 实例共存，用于多开测试）
     let socket = bind_udp_reusable(ip, UDP_PORT)
         .map_err(|e| format!("UDP 绑定 {ip}:{UDP_PORT} 失败: {e}"))?;
-    // 加入组播组（0.0.0.0 绑定则用 UNSPECIFIED 接口）
-    let iface = if ip.is_unspecified() { Ipv4Addr::UNSPECIFIED } else { ip };
-    socket.join_multicast_v4(MULTICAST_GROUP, iface).ok();
+    // 加入组播组：自动模式下显式使用真实 LAN 接口，
+    // 避免内核将组播组加到 Clash tun 等虚拟接口上（macOS 上尤其明显）。
+    let multicast_iface = if ip.is_unspecified() {
+        find_lan_interface_ip().unwrap_or(Ipv4Addr::UNSPECIFIED)
+    } else {
+        ip
+    };
+    socket.join_multicast_v4(MULTICAST_GROUP, multicast_iface).ok();
     let socket = Arc::new(socket);
 
     let my_id = state.device_id.clone();
@@ -225,13 +258,20 @@ async fn broadcast_probe(socket: &UdpSocket, state: &AppState, tcp_port: u16) {
     broadcast(socket, state, tcp_port).await;
 }
 
-/// 清理超过 `PEER_TIMEOUT_SECS` 未活跃的节点。
+/// 清理超过 `PEER_TIMEOUT_SECS` 未活跃的节点，
+/// **但保留仍有活跃 TCP 链接的节点**：避免「TCP 能通信但 UI 显示离线」。
 fn sweep_peers(state: &AppState) {
     let cutoff = now_ms() - PEER_TIMEOUT_SECS * 1000;
+    // try_lock 非阻塞：锁被占用时跳过本轮清理（下轮会补上），绝不阻塞广播循环。
+    let active_links: std::collections::HashSet<String> = state
+        .links
+        .try_lock()
+        .map(|l| l.keys().cloned().collect())
+        .unwrap_or_default();
     let changed = {
         let mut peers = state.peers.lock().unwrap();
         let before = peers.len();
-        peers.retain(|_, p| p.last_seen >= cutoff);
+        peers.retain(|id, p| p.last_seen >= cutoff || active_links.contains(id));
         before != peers.len()
     };
     if changed {
@@ -297,5 +337,34 @@ mod tests {
         let start = Instant::now();
         sleep_until(past).await;
         assert!(start.elapsed() < Duration::from_millis(100), "过期 deadline 应立即就绪");
+    }
+
+    // ---- 新增：虚拟 IP 与 LAN 接口判断测试 ----
+
+    /// is_virtual_ip 覆盖：Clash fake-ip / WireGuard CGNAT / link-local / 真实 LAN
+    #[test]
+    fn is_virtual_ip_covers_known_ranges() {
+        // Clash fake-ip 段
+        assert!(is_virtual_ip(&"198.18.0.1".parse().unwrap()));
+        assert!(is_virtual_ip(&"198.19.255.254".parse().unwrap()));
+        // WireGuard / CGNAT / Tailscale
+        assert!(is_virtual_ip(&"100.64.0.1".parse().unwrap()));
+        assert!(is_virtual_ip(&"100.127.255.254".parse().unwrap()));
+        // link-local
+        assert!(is_virtual_ip(&"169.254.1.1".parse().unwrap()));
+        // 真实局域网不应被误判
+        assert!(!is_virtual_ip(&"192.168.1.100".parse().unwrap()));
+        assert!(!is_virtual_ip(&"10.0.0.1".parse().unwrap()));
+        assert!(!is_virtual_ip(&"172.16.0.1".parse().unwrap()));
+        assert!(!is_virtual_ip(&"192.168.10.50".parse().unwrap()));
+    }
+
+    /// is_lan_interface：真实 LAN（有广播）= true，虚拟/VPN（无广播/虚拟 IP）= false
+    #[test]
+    fn is_lan_interface_combinations() {
+        assert!(is_lan_interface(&"192.168.1.100".parse().unwrap(), true));
+        assert!(!is_lan_interface(&"192.168.1.100".parse().unwrap(), false)); // 无广播 = 不是 LAN
+        assert!(!is_lan_interface(&"198.18.0.1".parse().unwrap(), true)); // 虚拟 IP = 不是 LAN
+        assert!(!is_lan_interface(&"169.254.1.1".parse().unwrap(), true)); // link-local = 不是 LAN
     }
 }
