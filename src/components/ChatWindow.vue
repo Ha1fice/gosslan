@@ -6,6 +6,8 @@ import { useChatStore } from "@/stores/useChatStore";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import MessageItem from "@/components/MessageItem.vue";
 import VirtualList from "@/components/VirtualList.vue";
+import GroupMemberPanel from "@/components/GroupMemberPanel.vue";
+import BaseModal from "@/components/BaseModal.vue";
 import {
   CLAMPED_CODE_BLOCK_HEIGHT,
   codeBlockHeight,
@@ -18,7 +20,9 @@ import {
   FilePlus,
   FolderOpen,
   Lock,
+  Pencil,
   Send,
+  Users,
 } from "lucide-vue-next";
 import type { MessageRecord } from "@/types";
 
@@ -62,6 +66,42 @@ const online = computed(() => {
   if (!conv.value || conv.value.kind !== "single") return false;
   return chat.friends.some((f) => f.device_id === conv.value!.id && f.online);
 });
+
+// ---------------- 群：成员面板 + 改名 ----------------
+const membersOpen = ref(false);
+const activeGroupId = computed(() =>
+  isGroup.value && chat.activeConv ? chat.activeConv.slice(6) : null,
+);
+const memberCount = computed(() => {
+  const gid = activeGroupId.value;
+  if (!gid) return 0;
+  return chat.groups.find((g) => g.id === gid)?.members.length ?? 0;
+});
+const canRename = computed(() => {
+  const gid = activeGroupId.value;
+  if (!gid) return false;
+  return chat.groups.find((g) => g.id === gid)?.creator === app.device?.device_id;
+});
+const renameOpen = ref(false);
+const renameInput = ref("");
+function openRename() {
+  const gid = activeGroupId.value;
+  if (!gid) return;
+  renameInput.value = chat.groups.find((g) => g.id === gid)?.name ?? "";
+  renameOpen.value = true;
+}
+async function confirmRename() {
+  const gid = activeGroupId.value;
+  const name = renameInput.value.trim();
+  renameOpen.value = false;
+  if (!gid || !name) return;
+  try {
+    await chat.renameGroup(gid, name);
+    app.toast("群名称已更新", "success");
+  } catch (e) {
+    app.toast(`重命名失败：${e}`, "error");
+  }
+}
 
 /** 当前会话的第一条未读索引（后端 markRead 前已记录，随历史 prepend 偏移）。 */
 const unreadIndex = computed(() => {
@@ -308,14 +348,33 @@ function fileToDataUrl(f: File): Promise<string> {
           {{ online ? "对方在线" : "对方离线" }}
         </span>
       </div>
-      <button
-        v-if="!isGroup"
-        class="flex items-center justify-center rounded-lg p-2 text-[var(--gosslan-text-2)] transition hover:bg-[var(--gosslan-hover)]"
-        title="共享目录"
-        @click="emit('open-share')"
-      >
-        <FolderOpen class="h-5 w-5" />
-      </button>
+      <div class="flex items-center gap-1">
+        <button
+          v-if="isGroup"
+          class="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-[var(--gosslan-text-2)] transition hover:bg-[var(--gosslan-hover)]"
+          title="群成员"
+          @click="membersOpen = true"
+        >
+          <Users class="h-4 w-4" />
+          {{ memberCount }}
+        </button>
+        <button
+          v-if="isGroup && canRename"
+          class="flex items-center justify-center rounded-lg p-2 text-[var(--gosslan-text-2)] transition hover:bg-[var(--gosslan-hover)]"
+          title="修改群名称"
+          @click="openRename"
+        >
+          <Pencil class="h-4 w-4" />
+        </button>
+        <button
+          v-if="!isGroup"
+          class="flex items-center justify-center rounded-lg p-2 text-[var(--gosslan-text-2)] transition hover:bg-[var(--gosslan-hover)]"
+          title="共享目录"
+          @click="emit('open-share')"
+        >
+          <FolderOpen class="h-5 w-5" />
+        </button>
+      </div>
     </div>
 
     <!-- 消息区（虚拟滚动，仅纵向） -->
@@ -400,5 +459,33 @@ function fileToDataUrl(f: File): Promise<string> {
         </button>
       </div>
     </div>
+
+    <!-- 群成员面板 -->
+    <GroupMemberPanel :open="membersOpen" :group-id="activeGroupId" @close="membersOpen = false" />
+
+    <!-- 修改群名称（仅群主可见入口） -->
+    <BaseModal :open="renameOpen" title="修改群名称" @close="renameOpen = false">
+      <div class="space-y-3">
+        <input
+          v-model="renameInput"
+          maxlength="30"
+          placeholder="请输入群名称"
+          class="w-full rounded-lg bg-[var(--gosslan-bg)] px-3 py-2 text-sm outline-none"
+          @keydown.enter="confirmRename"
+        />
+        <p class="text-xs text-[var(--gosslan-text-2)]">修改后会同步给所有群成员。</p>
+        <div class="flex justify-end gap-2 pt-1">
+          <button
+            class="rounded-lg px-4 py-1.5 text-sm transition hover:bg-[var(--gosslan-hover)]"
+            @click="renameOpen = false"
+          >取消</button>
+          <button
+            class="rounded-lg bg-primary px-4 py-1.5 text-sm text-white transition hover:bg-primary-hover disabled:opacity-40"
+            :disabled="!renameInput.trim()"
+            @click="confirmRename"
+          >保存</button>
+        </div>
+      </div>
+    </BaseModal>
   </div>
 </template>

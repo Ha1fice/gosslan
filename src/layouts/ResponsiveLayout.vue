@@ -41,7 +41,7 @@ onUnmounted(() => window.removeEventListener("navigate-to-contacts", onNavigateT
 
     <!-- 会话列表（桌面 300px / 移动端全宽，滑动切换） -->
     <aside
-      class="h-full shrink-0 overflow-hidden border-r border-[var(--gosslan-border)] transition-[width] duration-300 ease-out md:w-[300px]"
+      class="h-full shrink-0 overflow-hidden transition-[width] duration-300 ease-out md:w-[300px]"
       :class="app.isMobile ? (app.mobileView === 'list' ? 'w-full' : 'w-0') : 'w-[300px]'"
     >
       <div class="h-full w-[100vw] max-w-full md:w-[300px]">
