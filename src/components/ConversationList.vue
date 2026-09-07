@@ -8,11 +8,16 @@ import { Check, Search, UserMinus, UserPlus, UsersRound, X } from "lucide-vue-ne
 import BaseModal from "@/components/BaseModal.vue";
 import type { Conversation, Friend, PendingRequest, SearchResult } from "@/types";
 
-defineProps<{ view: "chats" | "contacts" }>();
+const props = defineProps<{
+  view: "chats" | "contacts";
+  /** 正在查看资料的好友 ID：通讯录里对应好友高亮 */
+  activeFriendId?: string | null;
+}>();
 const emit = defineEmits<{
   (e: "update:view", v: "chats" | "contacts"): void;
   (e: "open-add-friend"): void;
   (e: "open-group"): void;
+  (e: "open-friend", f: Friend): void;
 }>();
 
 const app = useAppStore();
@@ -121,8 +126,9 @@ function open(conv: Conversation) {
   chat.openConversation(conv.id);
   if (app.isMobile) app.mobileView = "chat";
 }
+/** 通讯录点击好友 → 打开资料页（发消息由资料页按钮触发，不再直接开会话） */
 function openFriend(f: Friend) {
-  chat.openConversation(f.device_id);
+  emit("open-friend", f);
   if (app.isMobile) app.mobileView = "chat";
 }
 async function accept(r: PendingRequest) {
@@ -348,15 +354,15 @@ onUnmounted(() => {
         <div
           v-for="f in filteredFriends"
           :key="f.device_id"
-          v-memo="[f.nickname, f.avatar, f.online, chat.activeConv === f.device_id]"
+          v-memo="[f.nickname, f.avatar, f.online, props.activeFriendId === f.device_id]"
           class="relative flex cursor-pointer items-center gap-3 rounded-xl px-2 py-2 transition hover:bg-[var(--gosslan-hover)]"
-          :class="chat.activeConv === f.device_id ? 'bg-primary-light' : ''"
+          :class="props.activeFriendId === f.device_id ? 'bg-primary-light' : ''"
           @click="openFriend(f)"
           @contextmenu="onFriendContext($event, f)"
         >
-          <!-- 选中态指示条：与右侧聊天窗联动 -->
+          <!-- 选中态指示条：与右侧资料页联动 -->
           <span
-            v-if="chat.activeConv === f.device_id"
+            v-if="props.activeFriendId === f.device_id"
             class="absolute left-0 top-1/2 h-6 w-[3px] -translate-y-1/2 rounded-full bg-primary"
           ></span>
           <div class="relative">
@@ -375,9 +381,9 @@ onUnmounted(() => {
           <div class="min-w-0 flex-1">
             <div
               class="truncate text-sm font-medium"
-              :class="chat.activeConv === f.device_id ? 'text-primary' : ''"
+              :class="props.activeFriendId === f.device_id ? 'text-primary' : ''"
             >{{ f.nickname }}</div>
-            <div class="text-xs text-[var(--gosslan-text-2)]">{{ f.online ? "在线" : "离线" }}</div>
+            <div class="text-xs text-[var(--gosslan-text-2)]">{{ f.online ? "在线 · 查看资料" : "离线 · 查看资料" }}</div>
           </div>
         </div>
         <div v-if="filteredFriends.length === 0" class="mt-16 text-center text-sm text-[var(--gosslan-text-2)]">

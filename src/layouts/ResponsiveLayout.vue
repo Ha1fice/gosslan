@@ -1,20 +1,24 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, onMounted, onUnmounted, watch } from "vue";
 import { useAppStore } from "@/stores/useAppStore";
 import { useChatStore } from "@/stores/useChatStore";
 import NavRail from "@/components/NavRail.vue";
 import ConversationList from "@/components/ConversationList.vue";
 import ChatWindow from "@/components/ChatWindow.vue";
+import FriendProfile from "@/components/FriendProfile.vue";
 import SettingsPanel from "@/components/SettingsPanel.vue";
 import AddFriendModal from "@/components/AddFriendModal.vue";
 import GroupCreateModal from "@/components/GroupCreateModal.vue";
 import ShareDirectory from "@/components/ShareDirectory.vue";
 import { MessageCircle, Settings, Users } from "lucide-vue-next";
+import type { Friend } from "@/types";
 
 const app = useAppStore();
 const chat = useChatStore();
 
 const view = ref<"chats" | "contacts">("chats");
+/** 正在查看资料的好友（通讯录点击好友 → 展示资料页，而非直接开会话） */
+const profileFriend = ref<Friend | null>(null);
 const settingsOpen = ref(false);
 const addFriendOpen = ref(false);
 const groupOpen = ref(false);
@@ -24,6 +28,37 @@ function openSettings() {
   settingsOpen.value = true;
   if (app.isMobile) app.mobileView = "list";
 }
+
+function openFriendProfile(f: Friend) {
+  profileFriend.value = f;
+  if (app.isMobile) app.mobileView = "chat";
+}
+
+/** 资料页「发消息」：回到消息视图并打开与该好友的会话 */
+async function sendMessageTo(id: string) {
+  profileFriend.value = null;
+  view.value = "chats";
+  await chat.openConversation(id);
+  if (app.isMobile) app.mobileView = "chat";
+}
+
+async function removeFriend(f: Friend) {
+  profileFriend.value = null;
+  try {
+    await chat.removeFriend(f.device_id);
+    app.toast(`已删除好友 ${f.nickname}（可在添加好友中重新添加）`, "info");
+  } catch (e) {
+    app.toast(`删除失败：${e}`, "error");
+  }
+}
+
+// 打开会话/切走时收起资料页，避免右侧同时出现两个内容区
+watch(
+  () => chat.activeConv,
+  () => {
+    profileFriend.value = null;
+  },
+);
 
 // 通知点击跳转：好友申请通知 → 切换到联系人视图
 function onNavigateToContacts() {
@@ -47,20 +82,28 @@ onUnmounted(() => window.removeEventListener("navigate-to-contacts", onNavigateT
       <div class="h-full w-[100vw] max-w-full md:w-[300px]">
         <ConversationList
           :view="view"
+          :active-friend-id="profileFriend?.device_id ?? null"
           @update:view="view = $event"
           @open-add-friend="addFriendOpen = true"
           @open-group="groupOpen = true"
+          @open-friend="openFriendProfile"
         />
       </div>
     </aside>
 
-    <!-- 聊天区 -->
+    <!-- 右侧内容区：好友资料页 / 聊天 / 空态 -->
     <main
       class="flex h-full min-w-0 flex-1 flex-col"
       :class="app.isMobile && app.mobileView === 'list' ? 'hidden' : ''"
     >
       <div class="min-h-0 flex-1 pb-16 md:pb-0">
-        <ChatWindow v-if="chat.activeConv" @open-share="shareOpen = true" />
+        <FriendProfile
+          v-if="profileFriend"
+          :friend="profileFriend"
+          @send-message="sendMessageTo"
+          @remove="removeFriend"
+        />
+        <ChatWindow v-else-if="chat.activeConv" @open-share="shareOpen = true" />
         <div
           v-else
           class="flex h-full select-none flex-col items-center justify-center gap-3 text-[var(--gosslan-text-2)]"

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import dayjs from "dayjs";
 import { useAppStore } from "@/stores/useAppStore";
 import { useChatStore } from "@/stores/useChatStore";
@@ -7,6 +7,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import MessageItem from "@/components/MessageItem.vue";
 import VirtualList from "@/components/VirtualList.vue";
 import GroupMemberPanel from "@/components/GroupMemberPanel.vue";
+import EmojiPicker from "@/components/EmojiPicker.vue";
 import BaseModal from "@/components/BaseModal.vue";
 import {
   CLAMPED_CODE_BLOCK_HEIGHT,
@@ -22,6 +23,7 @@ import {
   Lock,
   Pencil,
   Send,
+  Smile,
   Users,
 } from "lucide-vue-next";
 import type { MessageRecord } from "@/types";
@@ -264,6 +266,37 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
+// ---------------- 表情面板 ----------------
+const emojiOpen = ref(false);
+
+/** 点击面板外关闭（面板自身已 @click.stop，触发按钮也 stop） */
+function onDocClickForEmoji() {
+  emojiOpen.value = false;
+}
+onMounted(() => document.addEventListener("click", onDocClickForEmoji));
+onUnmounted(() => document.removeEventListener("click", onDocClickForEmoji));
+watch(emojiOpen, () => {
+  if (emojiOpen.value) autoResize();
+});
+
+/** 把表情插到输入框光标处（无光标信息则追加末尾），保持焦点便于连续插入。 */
+function insertEmoji(e: string) {
+  const el = inputRef.value;
+  if (!el) {
+    draft.value += e;
+    return;
+  }
+  const start = el.selectionStart ?? draft.value.length;
+  const end = el.selectionEnd ?? draft.value.length;
+  draft.value = draft.value.slice(0, start) + e + draft.value.slice(end);
+  void nextTick(() => {
+    el.focus();
+    const pos = start + e.length;
+    el.setSelectionRange(pos, pos);
+    autoResize();
+  });
+}
+
 /** 统一发送文件：自动路由（直连优先，弱网/无直连自动中继），无需用户选择。 */
 async function attachFile() {
   const convId = chat.activeConv;
@@ -431,6 +464,17 @@ function fileToDataUrl(f: File): Promise<string> {
       </div>
       <div class="mt-2 flex items-center justify-between gap-2">
         <div class="flex min-w-0 items-center gap-1">
+          <div class="relative">
+            <button
+              class="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs transition"
+              :class="emojiOpen ? 'bg-primary-light text-primary' : 'text-[var(--gosslan-text-2)] hover:bg-[var(--gosslan-hover)]'"
+              title="表情"
+              @click.stop="emojiOpen = !emojiOpen"
+            >
+              <Smile class="h-4 w-4" />
+            </button>
+            <EmojiPicker :open="emojiOpen" @select="insertEmoji" @close="emojiOpen = false" />
+          </div>
           <button
             class="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs transition"
             :class="codeMode ? 'bg-primary-light text-primary' : 'text-[var(--gosslan-text-2)] hover:bg-[var(--gosslan-hover)]'"
