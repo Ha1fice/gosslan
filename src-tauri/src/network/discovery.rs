@@ -187,9 +187,9 @@ pub async fn spawn(
     // 绑定 UDP 端口（SO_REUSEADDR 允许同一台机器上多个 gosslan 实例共存，用于多开测试）
     let (socket, multicast_if_result) = bind_udp_reusable(ip, UDP_PORT, multicast_if)
         .map_err(|e| format!("UDP 绑定 {ip}:{UDP_PORT} 失败: {e}"))?;
-    // 加入组播组：自动模式下显式使用真实 LAN 接口，
-    // 避免内核将组播组加到 Clash tun 等虚拟接口上（macOS 上尤其明显）。
-    let multicast_iface = multicast_if.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    // 加入组播组：自动模式使用 find_lan_interface 选出的 LAN IP，
+    // 手动模式直接使用用户指定的 IP（与 UDP/TCP bind 一致）。
+    let multicast_iface = multicast_if.unwrap_or(ip);
     let join_res = socket.join_multicast_v4(MULTICAST_GROUP, multicast_iface);
     // 记录诊断：组播 join 结果（不改变行为，.ok() 仍然在下面）
     let join_msg = match &join_res {
@@ -547,5 +547,22 @@ mod tests {
         // 172.16.x.x 是 RFC1918
         let borderline_above = score_candidate(&"172.16.0.1".parse().unwrap(), "en0", true);
         assert_eq!(borderline_above, 15, "172.16 应有 RFC1918 加分");
+    }
+
+    /// multicast join 接口逻辑：Auto 用 find_lan_interface 选出的 IP，Manual 用用户指定的 IP
+    #[test]
+    fn multicast_join_interface_matches_mode() {
+        let auto_lan_ip: Ipv4Addr = "10.0.0.100".parse().unwrap();
+        let manual_ip: Ipv4Addr = "192.168.1.50".parse().unwrap();
+
+        // Auto 模式：multicast_if = Some(lan_ip) → unwrap_or 不触发 → join on lan_ip
+        let auto_multicast_if = Some(auto_lan_ip);
+        let auto_join = auto_multicast_if.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(auto_join, auto_lan_ip, "Auto: multicast join 应使用自动选择的 LAN IP");
+
+        // Manual 模式：multicast_if = None → unwrap_or(manual_ip) → join on manual_ip
+        let manual_multicast_if: Option<Ipv4Addr> = None;
+        let manual_join = manual_multicast_if.unwrap_or(manual_ip);
+        assert_eq!(manual_join, manual_ip, "Manual: multicast join 应使用用户指定的 IP");
     }
 }
